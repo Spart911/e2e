@@ -26,6 +26,8 @@ dependencies = [
   "tqdm>=4.67.1",
   "wandb>=0.19",
   "zarr>=3.0.4",
+  "transformers>=4.44",
+  "sentencepiece>=0.2",
 ]
 
 [project.scripts]

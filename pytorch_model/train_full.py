@@ -64,10 +64,9 @@ def train_one_epoch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Full fine-tuning of the transformer LM")
-    parser.add_argument("--checkpoint_in", type=str, default=None,
-                        help="Путь к исходному чекпоинту (.pt) или None для случайной инициализации")
-    parser.add_argument("--data_path", type=str, required=True,
-                        help="Текстовый файл с данными для обучения")
+    parser.add_argument("--dataset_fraction", type=float, default=1.0, help="Доля датасета для обучения (0.1 = 10%)")
+    parser.add_argument("--checkpoint_in", type=str, default=None,help="Путь к исходному чекпоинту (.pt) или None для случайной инициализации")
+    parser.add_argument("--data_path", type=str, required=True,help="Текстовый файл с данными для обучения")
     parser.add_argument("--tokenizer", type=str, default="meta-llama/Meta-Llama-3-8B")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=10)
@@ -97,6 +96,7 @@ def main() -> None:
         tokenizer=tokenizer,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
+        dataset_fraction=args.dataset_fraction,
         device=device,
         shuffle=True,
     )

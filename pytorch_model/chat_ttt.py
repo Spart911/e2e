@@ -18,7 +18,7 @@ from __future__ import annotations
 """
 
 import argparse
-
+import sys
 import torch
 from transformers import AutoTokenizer
 
@@ -37,7 +37,11 @@ def tokenize(text: str, tokenizer) -> torch.Tensor:
 
 
 def main() -> None:
+    sys.stdin.reconfigure(encoding="utf-8", errors="ignore")
+    sys.stdout.reconfigure(encoding="utf-8")
+
     parser = argparse.ArgumentParser(description="Chat inference with TTT")
+
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Путь к чекпоинту (.pt) формата {'model_weights': ...}")
     parser.add_argument("--tokenizer", type=str, default="meta-llama/Meta-Llama-3-8B")

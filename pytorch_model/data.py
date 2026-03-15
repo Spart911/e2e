@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 from .transformer import Batch
 
@@ -97,19 +97,22 @@ def create_dataloader(
     batch_size: int,
     device: torch.device,
     shuffle: bool = True,
+    dataset_fraction: float = 1.0,
 ) -> DataLoader:
     """
-    Построить `DataLoader` для обучения языковой модели на одном текстовом файле.
+    Построить DataLoader для обучения языковой модели.
 
-    Параметры:
-      - path: путь к текстовому файлу;
-      - tokenizer: HuggingFace‑токенизатор;
-      - seq_len: длина последовательности (без учёта сдвига);
-      - batch_size: размер батча;
-      - device: устройство, на которое сразу кладём тензоры;
-      - shuffle: перемешивать ли примеры между эпохами.
+    dataset_fraction:
+        доля датасета (0.1 = 10%)
     """
+
     dataset = TextDataset(path, tokenizer=tokenizer, seq_len=seq_len)
+
+    # Ограничиваем размер датасета
+    if dataset_fraction < 1.0:
+        n_samples = int(len(dataset) * dataset_fraction)
+        indices = torch.randperm(len(dataset))[:n_samples]
+        dataset = Subset(dataset, indices)
 
     def _collate(batch: List[torch.Tensor]) -> Batch:
         return collate_lm(batch, device=device)
@@ -120,5 +123,4 @@ def create_dataloader(
         shuffle=shuffle,
         collate_fn=_collate,
     )
-
 

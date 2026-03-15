@@ -161,17 +161,14 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """
-    Apply RoPE to x.
-      x:         [..., T, head_dim]
-      freqs_cis: [T, head_dim//2]  complex
-    """
-    input_dtype = x.dtype
-    x_f = x.float().reshape(*x.shape[:-1], -1, 2)
-    x_c = torch.view_as_complex(x_f)          # [..., T, head_dim//2]
-    shape = [1] * (x_c.ndim - 2) + list(freqs_cis.shape)
-    x_out = torch.view_as_real(x_c * freqs_cis.view(*shape)).reshape(*x.shape)
-    return x_out.to(input_dtype)
+    B, T, H, D = x.shape
+    x = x.reshape(B, T, H, D // 2, 2)
+    x_c = torch.view_as_complex(x)  # [B, T, H, D/2]
+    # freqs_cis должен быть [B, T, H, D/2] или [B, T, 1, D/2]
+    if freqs_cis.ndim == 3:  # [B, T, D/2]
+        freqs_cis = freqs_cis.unsqueeze(2)  # [B, T, 1, D/2]
+    x_out = torch.view_as_real(x_c * freqs_cis).reshape(B, T, H, D)
+    return x_out
 
 
 class NormalLinear(nn.Module):
@@ -257,20 +254,20 @@ class AttentionBase(nn.Module):
         return x.view(B, T, self.num_heads, self.head_dim)
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """[T, num_heads, head_dim] -> [T, D]"""
-        return x.reshape(x.shape[0], self.num_heads * self.head_dim)
+        # x: [B, T, H, D]
+        B, T, H, D = x.shape
+        return x.reshape(B, T, H * D)
 
     def project_qkv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-    def apply_rope(
-        self,
-        xis: tuple[torch.Tensor, ...],
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, ...]:
-        freqs = self.freqs_cis[position_ids]
+    def apply_rope(self, xis: tuple[torch.Tensor, ...], position_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # xis: xq/xk [B, T, H, D]
+        # position_ids: [B, T]
+        freqs = self.freqs_cis[position_ids]  # [B, T, D/2] (нужно правильно broadcast)
+        freqs = freqs.unsqueeze(2)  # [B, T, 1, D/2]
         return tuple(apply_rotary_emb(x, freqs) for x in xis)
 
     def get_attention_input(
@@ -338,19 +335,18 @@ class Attention(AttentionBase):
         state,
         is_prefix: bool = False,
     ) -> tuple[torch.Tensor, Any]:
-        T = hidden_states.shape[0]
-        position_ids = (
-            torch.arange(T, device=hidden_states.device)
-            if seq.position_ids is None
-            else seq.position_ids
-        )
+        B, T, _ = hidden_states.shape
+        if seq.position_ids is None:
+            position_ids = torch.arange(T, device=hidden_states.device).unsqueeze(0).expand(B, T)  # [B, T]
+        else:
+            position_ids = seq.position_ids
         xq, xk, xv = self.get_attention_input(hidden_states, position_ids)
 
         xq_ = xq.permute(0, 2, 1, 3)
         xk_ = xk.permute(0, 2, 1, 3)
         xv_ = xv.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(xq_, xk_, xv_, is_causal=True)
-        attn_out = self._merge_heads(attn_out.permute(0, 2, 1, 3).squeeze(0))
+        attn_out = self._merge_heads(attn_out.permute(0, 2, 1, 3))
         return self.get_attention_output(attn_out), state
 
 

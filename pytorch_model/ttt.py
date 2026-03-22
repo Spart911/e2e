@@ -5,8 +5,12 @@ from copy import deepcopy
 
 import torch
 
-from .transformer import CausalLM, Batch, cross_entropy_loss_and_accuracy
-from .config import MODEL_CFG
+try:
+    from .transformer import CausalLM, Batch, cross_entropy_loss_and_accuracy
+    from .config import MODEL_CFG
+except ImportError:  # script-mode fallback
+    from transformer import CausalLM, Batch, cross_entropy_loss_and_accuracy  # type: ignore
+    from config import MODEL_CFG  # type: ignore
 
 
 def get_inner_params(model: CausalLM) -> dict[str, torch.nn.Parameter]:
@@ -145,5 +149,4 @@ def ttt_adapt(
         p.requires_grad_(False)
 
     return adapted
-
 

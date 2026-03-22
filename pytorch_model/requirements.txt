@@ -1,0 +1,6 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.23.0
+transformers>=4.39.0
+prometheus-client>=0.20.0
+langdetect>=1.0.9
+# torch не ставим: уже есть в базовом образе pytorch/pytorch

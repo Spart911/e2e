@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from .transformer import ModelConfig
+try:
+    from .transformer import ModelConfig
+except ImportError:  # script-mode fallback
+    from transformer import ModelConfig  # type: ignore
 
 
 # Базовая конфигурация модели, аналогичная `MODEL_CFG` из `inference_ttt.py`.
@@ -37,4 +40,3 @@ def get_device(device_str: str | None = None) -> torch.device:
     if device_str is not None:
         return torch.device(device_str)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-

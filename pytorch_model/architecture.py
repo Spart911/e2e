@@ -5,8 +5,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .transformer import Batch, CausalLM, cross_entropy_loss_and_accuracy
-from .config import MODEL_CFG
+try:
+    from .transformer import Batch, CausalLM, cross_entropy_loss_and_accuracy
+    from .config import MODEL_CFG
+except ImportError:  # script-mode fallback
+    from transformer import Batch, CausalLM, cross_entropy_loss_and_accuracy  # type: ignore
+    from config import MODEL_CFG  # type: ignore
 
 
 @dataclass
@@ -125,7 +129,10 @@ def generate(
             loss_masks=dummy_mask,
         )
 
-        from .config import MODEL_CFG as _CFG  # локальный импорт, чтобы избежать циклов
+        try:
+            from .config import MODEL_CFG as _CFG  # локальный импорт, чтобы избежать циклов
+        except ImportError:  # script-mode fallback
+            from config import MODEL_CFG as _CFG  # type: ignore
 
         # В простом сценарии инициализируем состояние блоков как None
         # (можно заменить на более сложный KV‑кэш, если потребуется).
@@ -198,4 +205,3 @@ def lm_loss(
         logits, batch.target_tokens, batch.loss_masks
     )
     return loss
-

@@ -18,10 +18,16 @@ from torch.utils.data import DataLoader
 
 from transformers import AutoTokenizer
 
-from .architecture import build_model
-from .config import MODEL_CFG, get_device
-from .data import create_dataloader
-from .losses import language_modeling_loss
+try:
+    from .architecture import build_model
+    from .config import MODEL_CFG, get_device
+    from .data import create_dataloader
+    from .losses import language_modeling_loss
+except ImportError:  # script-mode fallback
+    from architecture import build_model  # type: ignore
+    from config import MODEL_CFG, get_device  # type: ignore
+    from data import create_dataloader  # type: ignore
+    from losses import language_modeling_loss  # type: ignore
 
 
 def train_one_epoch(
@@ -121,4 +127,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

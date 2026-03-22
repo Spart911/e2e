@@ -6,7 +6,10 @@ from typing import Iterable, List
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from .transformer import Batch
+try:
+    from .transformer import Batch
+except ImportError:  # script-mode fallback
+    from transformer import Batch  # type: ignore
 
 
 class TextDataset(Dataset):
@@ -123,4 +126,3 @@ def create_dataloader(
         shuffle=shuffle,
         collate_fn=_collate,
     )
-

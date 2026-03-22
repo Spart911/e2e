@@ -22,9 +22,14 @@ import sys
 import torch
 from transformers import AutoTokenizer
 
-from .architecture import build_model, generate, GenerationConfig
-from .config import get_device
-from .ttt import ttt_adapt
+try:
+    from .architecture import build_model, generate, GenerationConfig
+    from .config import get_device
+    from .ttt import ttt_adapt
+except ImportError:  # script-mode fallback
+    from architecture import build_model, generate, GenerationConfig  # type: ignore
+    from config import get_device  # type: ignore
+    from ttt import ttt_adapt  # type: ignore
 
 
 def tokenize(text: str, tokenizer) -> torch.Tensor:
@@ -125,4 +130,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

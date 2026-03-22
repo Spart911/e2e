@@ -335,6 +335,9 @@ class Attention(AttentionBase):
         state,
         is_prefix: bool = False,
     ) -> tuple[torch.Tensor, Any]:
+        # Гарантируем форму [B, T, D]
+        if hidden_states.dim() != 3:
+            hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], -1)
         B, T, _ = hidden_states.shape
         if seq.position_ids is None:
             position_ids = torch.arange(T, device=hidden_states.device).unsqueeze(0).expand(B, T)  # [B, T]
@@ -342,12 +345,26 @@ class Attention(AttentionBase):
             position_ids = seq.position_ids
         xq, xk, xv = self.get_attention_input(hidden_states, position_ids)
 
+        # KV-кэш: state = (k_cache, v_cache)
+        k_cache, v_cache = (state or (None, None))
+        if k_cache is not None:
+            xk = torch.cat([k_cache, xk], dim=1)
+            xv = torch.cat([v_cache, xv], dim=1)
+
         xq_ = xq.permute(0, 2, 1, 3)
         xk_ = xk.permute(0, 2, 1, 3)
         xv_ = xv.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(xq_, xk_, xv_, is_causal=True)
         attn_out = self._merge_heads(attn_out.permute(0, 2, 1, 3))
-        return self.get_attention_output(attn_out), state
+
+        # ограничиваем длину кэша, если задано окно
+        k_new = xk
+        v_new = xv
+        if self.config.sliding_window_size and k_new.shape[1] > self.config.sliding_window_size:
+            k_new = k_new[:, -self.config.sliding_window_size :, :, :]
+            v_new = v_new[:, -self.config.sliding_window_size :, :, :]
+
+        return self.get_attention_output(attn_out), (k_new, v_new)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -666,5 +683,3 @@ def token_log_probs(
         .gather(-1, targets.long().unsqueeze(-1))
         .squeeze(-1)
     )
-
-

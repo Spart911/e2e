@@ -6,18 +6,19 @@ import json
 import os
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from langdetect import detect
 from prometheus_client import (
+    CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Counter,
     Histogram,
-    CONTENT_TYPE_LATEST,
     generate_latest,
 )
 from pydantic import BaseModel, Field
@@ -29,20 +30,29 @@ if __package__ is None or __package__ == "":
     from pathlib import Path
 
     sys.path.append(str(Path(__file__).resolve().parent))
-    from architecture import GenerationConfig, build_model, generate  # type: ignore
+    from architecture import GenerationConfig, build_model  # type: ignore
     from config import get_device  # type: ignore
+    from session_cache import RedisTTTSessionCache  # type: ignore
     from transformer import Batch  # type: ignore
+    from ttt import extract_inner_state_dict, load_inner_state_dict, ttt_adapt  # type: ignore
 else:
-    from .architecture import GenerationConfig, build_model, generate
+    from .architecture import GenerationConfig, build_model
     from .config import get_device
+    from .session_cache import RedisTTTSessionCache
     from .transformer import Batch
+    from .ttt import extract_inner_state_dict, load_inner_state_dict, ttt_adapt
 
 # Разрешаем TF32 для ускорения на Ampere+ (если доступно)
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+
+# ------------------------------
 # Pydantic модели под OpenAI API
+# ------------------------------
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -58,6 +68,11 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = 0
     repetition_penalty: float = 1.1
     stream: bool = False
+
+    # user оставляем для OpenAI-совместимых клиентов
+    # session_id — наш явный способ управлять TTT-сессией
+    user: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -96,7 +111,6 @@ MAX_BATCH_SIZE = 8
 BATCH_DELAY = 0.01  # секунды, чтобы накопить несколько запросов
 REQUEST_TIMEOUT = 60  # таймаут ожидания ответа для клиента
 
-
 request_queue: asyncio.Queue[QueueItem] = asyncio.Queue()
 
 
@@ -119,16 +133,55 @@ model.eval()
 for p in model.parameters():
     p.requires_grad_(False)
 
+# --- конфиг сессионного TTT ---
+TTT_STEPS = int(os.environ.get("TTT_STEPS", 5))
+TTT_LR = float(os.environ.get("TTT_LR", 1e-3))
+TTT_SAVE_EACH_STEP = os.environ.get("TTT_SAVE_EACH_STEP", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+SESSION_TTL_SEC = int(os.environ.get("SESSION_TTL_SEC", 3600))
+SESSION_LOCK_TTL_SEC = int(os.environ.get("SESSION_LOCK_TTL_SEC", 30))
+SESSION_LOCK_BLOCKING_TIMEOUT_SEC = float(
+    os.environ.get("SESSION_LOCK_BLOCKING_TIMEOUT_SEC", 10.0)
+)
+MODEL_REVISION = os.environ.get("MODEL_REVISION") or os.path.basename(checkpoint_path)
+
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+SESSION_CACHE: RedisTTTSessionCache | None = None
+if REDIS_URL:
+    SESSION_CACHE = RedisTTTSessionCache(
+        redis_url=REDIS_URL,
+        ttl_sec=SESSION_TTL_SEC,
+        lock_ttl_sec=SESSION_LOCK_TTL_SEC,
+        lock_blocking_timeout_sec=SESSION_LOCK_BLOCKING_TIMEOUT_SEC,
+    )
+    print(
+        f"[startup] Redis session cache enabled: "
+        f"redis_url={REDIS_URL}, model_revision={MODEL_REVISION}"
+    )
+else:
+    print("[startup] Redis session cache disabled")
+
 # Токсичность (ленивая инициализация)
-toxicity_clf = None
+toxicity_clf: Any | None = None
 TOXICITY_MODEL = os.environ.get("TOXICITY_MODEL", "").strip()
+
 
 def _get_toxicity_clf():
     global toxicity_clf
     if toxicity_clf is None:
         model_name = TOXICITY_MODEL or "unitary/toxic-bert"
-        toxicity_clf = pipeline("text-classification", model=model_name, device=0 if device.type == "cuda" else -1)
+        toxicity_clf = pipeline(
+            "text-classification",
+            model=model_name,
+            device=0 if device.type == "cuda" else -1,
+        )
     return toxicity_clf
+
 
 # ------------------------------
 # Метрики Prometheus (только наши)
@@ -174,7 +227,6 @@ JSON_SUCCESS = Counter(
 )
 
 
-
 # ------------------------------
 # Вспомогательные функции
 # ------------------------------
@@ -201,11 +253,7 @@ def messages_to_chatml(messages: List[ChatMessage]) -> str:
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", 4096))
 
 
-def run_inference(req: ChatCompletionRequest) -> ChatCompletionResponse:
-    if not req.messages:
-        raise HTTPException(status_code=400, detail="messages пусты")
-
-    prompt_text = messages_to_chatml(req.messages)
+def record_prompt_metrics(prompt_text: str) -> None:
     PROMPT_LENGTH.observe(len(prompt_text))
     try:
         lang = detect(prompt_text)
@@ -213,29 +261,8 @@ def run_inference(req: ChatCompletionRequest) -> ChatCompletionResponse:
         lang = "unknown"
     LANG_COUNTER.labels(lang=lang).inc()
 
-    prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").squeeze(0)
-    if prompt_ids.shape[0] > MAX_CONTEXT_TOKENS:
-        prompt_ids = prompt_ids[-MAX_CONTEXT_TOKENS:]
-    prompt_ids = prompt_ids.to(device)
 
-    gen_cfg = GenerationConfig(
-        max_new_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        top_k=req.top_k,
-        repetition_penalty=req.repetition_penalty,
-        eos_token_id=tokenizer.eos_token_id or 128001,
-    )
-
-    with torch.no_grad():
-        new_ids = generate_with_cache(
-            model,
-            prompt_ids=prompt_ids,
-            device=device,
-            gen_cfg=gen_cfg,
-        )
-
-    reply_text = tokenizer.decode(new_ids.tolist(), skip_special_tokens=True)
+def record_response_metrics(reply_text: str) -> None:
     RESPONSE_LENGTH.observe(len(reply_text))
 
     # Попытка оценить токсичность, если модель доступна
@@ -252,6 +279,220 @@ def run_inference(req: ChatCompletionRequest) -> ChatCompletionResponse:
         JSON_SUCCESS.labels(status="valid").inc()
     except Exception:
         JSON_SUCCESS.labels(status="invalid").inc()
+
+
+def build_prompt_ids(req: ChatCompletionRequest) -> torch.Tensor:
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages пусты")
+
+    prompt_text = messages_to_chatml(req.messages)
+    record_prompt_metrics(prompt_text)
+
+    prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").squeeze(0)
+    if prompt_ids.shape[0] > MAX_CONTEXT_TOKENS:
+        prompt_ids = prompt_ids[-MAX_CONTEXT_TOKENS:]
+    return prompt_ids.to(device)
+
+
+def build_generation_config(req: ChatCompletionRequest) -> GenerationConfig:
+    return GenerationConfig(
+        max_new_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        repetition_penalty=req.repetition_penalty,
+        eos_token_id=tokenizer.eos_token_id or 128001,
+    )
+
+
+def extract_session_id(req: ChatCompletionRequest) -> str | None:
+    session_id = (req.session_id or req.user or "").strip()
+    return session_id or None
+
+
+def extract_last_user_message(messages: List[ChatMessage]) -> str | None:
+    for msg in reversed(messages):
+        if msg.role == "user" and msg.content.strip():
+            return msg.content
+    return None
+
+
+def _build_one_shot_ttt_model(user_text: str):
+    context_ids = tokenizer.encode(user_text, return_tensors="pt").squeeze(0).to(device)
+    if int(context_ids.shape[0]) < 2 or TTT_STEPS <= 0:
+        return model
+
+    return ttt_adapt(
+        model,
+        context_ids=context_ids,
+        device=device,
+        n_steps=TTT_STEPS,
+        lr=TTT_LR,
+        verbose=False,
+        clone_model=True,
+    )
+
+
+def build_inference_model_for_request(req: ChatCompletionRequest):
+    """
+    Возвращает модель для генерации:
+      - base model, если TTT не нужен;
+      - одноразово адаптированную копию, если нет session_id;
+      - сессионно адаптированную копию с load/save через Redis, если session_id есть.
+    """
+    user_text = extract_last_user_message(req.messages)
+    if not user_text or TTT_STEPS <= 0:
+        return model
+
+    context_ids = tokenizer.encode(user_text, return_tensors="pt").squeeze(0).to(device)
+    session_id = extract_session_id(req)
+
+    # Если TTT невозможен на одном токене — просто работаем без нового шага адаптации.
+    # При session_id ниже всё равно можно использовать уже восстановленное состояние.
+    can_run_ttt = int(context_ids.shape[0]) >= 2
+
+    # Нет Redis или нет session_id -> одноразовая адаптация
+    if SESSION_CACHE is None or not session_id:
+        if not can_run_ttt:
+            return model
+        return ttt_adapt(
+            model,
+            context_ids=context_ids,
+            device=device,
+            n_steps=TTT_STEPS,
+            lr=TTT_LR,
+            verbose=False,
+            clone_model=True,
+        )
+
+    assert SESSION_CACHE is not None
+
+    def save_step_callback(
+        step_idx: int,
+        model_after_step,
+        inner_state: dict[str, torch.Tensor],
+        loss_value: float,
+    ) -> None:
+        if not TTT_SAVE_EACH_STEP:
+            return
+        try:
+            SESSION_CACHE.save_inner_state(
+                session_id,
+                inner_state,
+                checkpoint_id=MODEL_REVISION,
+                extra_meta={
+                    "mode": "intermediate",
+                    "step": step_idx,
+                    "loss": loss_value,
+                },
+            )
+        except Exception as exc:
+            print(
+                f"[warn] failed to save intermediate inner_state for "
+                f"session_id={session_id}: {exc}"
+            )
+
+    # lock держим только на фазе load -> apply -> ttt -> save
+    # генерация идёт уже после unlock
+    try:
+        with SESSION_CACHE.session_lock(
+            session_id,
+            timeout_sec=SESSION_LOCK_TTL_SEC,
+            blocking_timeout_sec=SESSION_LOCK_BLOCKING_TIMEOUT_SEC,
+        ):
+            session_model = deepcopy(model)
+
+            cached_inner_state: dict[str, torch.Tensor] | None = None
+            try:
+                cached_inner_state = SESSION_CACHE.load_inner_state(
+                    session_id,
+                    checkpoint_id=MODEL_REVISION,
+                    device=device,
+                )
+            except Exception as exc:
+                print(
+                    f"[warn] failed to load session cache for session_id={session_id}: {exc}"
+                )
+                with contextlib.suppress(Exception):
+                    SESSION_CACHE.delete_session(session_id)
+
+            if cached_inner_state is not None:
+                try:
+                    load_inner_state_dict(session_model, cached_inner_state, strict=True)
+                except Exception as exc:
+                    print(
+                        f"[warn] incompatible cached inner_state for session_id={session_id}, "
+                        f"resetting cache: {exc}"
+                    )
+                    with contextlib.suppress(Exception):
+                        SESSION_CACHE.delete_session(session_id)
+
+            if can_run_ttt:
+                adapted_model = ttt_adapt(
+                    session_model,
+                    context_ids=context_ids,
+                    device=device,
+                    n_steps=TTT_STEPS,
+                    lr=TTT_LR,
+                    verbose=False,
+                    clone_model=False,
+                    step_callback=save_step_callback if TTT_SAVE_EACH_STEP else None,
+                )
+                try:
+                    SESSION_CACHE.save_inner_state(
+                        session_id,
+                        extract_inner_state_dict(adapted_model),
+                        checkpoint_id=MODEL_REVISION,
+                        extra_meta={
+                            "mode": "final",
+                            "prompt_tokens": int(context_ids.shape[0]),
+                        },
+                    )
+                except Exception as exc:
+                    print(
+                        f"[warn] failed to save final inner_state for "
+                        f"session_id={session_id}: {exc}"
+                    )
+                return adapted_model
+
+            # TTT на этом сообщении не делаем, но сохранённое состояние сессии уже применено.
+            session_model.eval()
+            for p in session_model.parameters():
+                p.requires_grad_(False)
+            return session_model
+
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"session_id '{session_id}' is busy",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(
+            f"[warn] session cache path failed for session_id={session_id}, "
+            f"fallback to one-shot TTT/base model: {exc}"
+        )
+        if not can_run_ttt:
+            return model
+        return _build_one_shot_ttt_model(user_text)
+
+
+def run_inference(req: ChatCompletionRequest) -> ChatCompletionResponse:
+    prompt_ids = build_prompt_ids(req)
+    gen_cfg = build_generation_config(req)
+    inference_model = build_inference_model_for_request(req)
+
+    with torch.no_grad():
+        new_ids = generate_with_cache(
+            inference_model,
+            prompt_ids=prompt_ids,
+            device=device,
+            gen_cfg=gen_cfg,
+        )
+
+    reply_text = tokenizer.decode(new_ids.tolist(), skip_special_tokens=True)
+    record_response_metrics(reply_text)
 
     prompt_tokens = int(prompt_ids.shape[0])
     completion_tokens = len(new_ids)
@@ -276,7 +517,11 @@ def run_inference(req: ChatCompletionRequest) -> ChatCompletionResponse:
     return response
 
 
-def sample_next_token(logits: torch.Tensor, generated: torch.Tensor, gen_cfg: GenerationConfig) -> torch.Tensor:
+def sample_next_token(
+    logits: torch.Tensor,
+    generated: torch.Tensor,
+    gen_cfg: GenerationConfig,
+) -> torch.Tensor:
     # Защита: убеждаемся, что logits 1D
     if logits.dim() > 1:
         logits = logits.view(-1)
@@ -426,9 +671,11 @@ async def batch_worker() -> None:
         for qi in batch:
             try:
                 result = run_inference(qi.request)
-                qi.future.set_result(result)
+                if not qi.future.done():
+                    qi.future.set_result(result)
             except Exception as exc:  # pylint: disable=broad-except
-                qi.future.set_exception(exc)
+                if not qi.future.done():
+                    qi.future.set_exception(exc)
             finally:
                 request_queue.task_done()
 
@@ -442,6 +689,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Local LM Inference (OpenAI API совместимость)", lifespan=lifespan)
+
 
 # ------------------------------
 # FastAPI endpoints
@@ -461,37 +709,46 @@ async def metrics() -> Response:
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
     start = time.monotonic()
+
     # Стриминговые запросы обрабатываем сразу (без батчевой очереди)
     if req.stream:
+        prompt_ids = build_prompt_ids(req)
+        gen_cfg = build_generation_config(req)
+        inference_model = build_inference_model_for_request(req)
+
         async def event_stream():
-            if not req.messages:
-                yield "data: {}\n\n"
-                return
-            prompt_text = messages_to_chatml(req.messages)
-            prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").squeeze(0)
-            if prompt_ids.shape[0] > MAX_CONTEXT_TOKENS:
-                prompt_ids = prompt_ids[-MAX_CONTEXT_TOKENS:]
-            prompt_ids = prompt_ids.to(device)
-
-            gen_cfg = GenerationConfig(
-                max_new_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                top_k=req.top_k,
-                repetition_penalty=req.repetition_penalty,
-                eos_token_id=tokenizer.eos_token_id or 128001,
-            )
-
             accumulated_text = ""
             prompt_tokens = len(prompt_ids)
             completion_tokens = 0
             created_ts = int(time.time())
 
-            for tok_id in generate_stream_with_cache(model, prompt_ids, device, gen_cfg):
-                completion_tokens += 1
-                token_text = tokenizer.decode([tok_id], skip_special_tokens=True)
-                accumulated_text += token_text
-                chunk = {
+            try:
+                for tok_id in generate_stream_with_cache(
+                    inference_model,
+                    prompt_ids,
+                    device,
+                    gen_cfg,
+                ):
+                    completion_tokens += 1
+                    token_text = tokenizer.decode([tok_id], skip_special_tokens=True)
+                    accumulated_text += token_text
+
+                    chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex}",
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": token_text},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                final_chunk = {
                     "id": f"chatcmpl-{uuid.uuid4().hex}",
                     "object": "chat.completion.chunk",
                     "created": created_ts,
@@ -499,48 +756,35 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"role": "assistant", "content": token_text},
-                            "finish_reason": None,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": "stop",
                         }
                     ],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
                 }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                record_response_metrics(accumulated_text)
+                REQUEST_LATENCY.observe(time.monotonic() - start)
 
-            # финальный блок
-            final_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion.chunk",
-                "created": created_ts,
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                },
-            }
-            yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        resp = StreamingResponse(event_stream(), media_type="text/event-stream")
-        REQUEST_LATENCY.observe(time.monotonic() - start)
-        return resp
-
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     await request_queue.put(QueueItem(request=req, future=fut))
+
     try:
         resp = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT)
-        REQUEST_LATENCY.observe(time.monotonic() - start)
         return resp
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="inference timeout") from exc
+    finally:
+        REQUEST_LATENCY.observe(time.monotonic() - start)
 
 
 if __name__ == "__main__":
@@ -554,4 +798,9 @@ if __name__ == "__main__":
     if __package__ in (None, ""):
         uvicorn.run(app, host=host, port=port, reload=False)
     else:
-        uvicorn.run("pytorch_model.inference_service:app", host=host, port=port, reload=False)
+        uvicorn.run(
+            "pytorch_model.inference_service:app",
+            host=host,
+            port=port,
+            reload=False,
+        )

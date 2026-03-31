@@ -81,16 +81,6 @@ def load_inner_state_dict(
     *,
     strict: bool = True,
 ) -> dict[str, Any]:
-    """
-    Наложить inner_state на модель.
-
-    strict=True:
-      - проверяем, что набор ключей совпадает с текущими inner-параметрами;
-      - проверяем совпадение shape;
-      - при несовместимости выбрасываем исключение.
-
-    Возвращает отчёт для логирования/отладки.
-    """
     inner_params = get_inner_params(model)
     expected_keys = set(inner_params.keys())
     provided_keys = set(inner_state.keys())
@@ -101,18 +91,14 @@ def load_inner_state_dict(
     shape_mismatches: list[str] = []
     loaded_keys: list[str] = []
 
-    with torch.no_grad():
-        for name, tensor in inner_state.items():
-            if name not in inner_params:
-                continue
-            param = inner_params[name]
-            if tuple(param.shape) != tuple(tensor.shape):
-                shape_mismatches.append(
-                    f"{name}: expected {tuple(param.shape)}, got {tuple(tensor.shape)}"
-                )
-                continue
-            param.copy_(tensor.to(device=param.device, dtype=param.dtype))
-            loaded_keys.append(name)
+    for name, tensor in inner_state.items():
+        if name not in inner_params:
+            continue
+        param = inner_params[name]
+        if tuple(param.shape) != tuple(tensor.shape):
+            shape_mismatches.append(
+                f"{name}: expected {tuple(param.shape)}, got {tuple(tensor.shape)}"
+            )
 
     if strict and (missing_keys or unexpected_keys or shape_mismatches):
         problems: list[str] = []
@@ -123,6 +109,16 @@ def load_inner_state_dict(
         if shape_mismatches:
             problems.append(f"shape_mismatches={shape_mismatches[:10]}")
         raise ValueError("inner_state несовместим с моделью: " + "; ".join(problems))
+
+    with torch.no_grad():
+        for name, tensor in inner_state.items():
+            if name not in inner_params:
+                continue
+            param = inner_params[name]
+            if tuple(param.shape) != tuple(tensor.shape):
+                continue
+            param.copy_(tensor.to(device=param.device, dtype=param.dtype))
+            loaded_keys.append(name)
 
     return {
         "loaded_keys": loaded_keys,

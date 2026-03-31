@@ -9,16 +9,33 @@ services:
       - MAX_CONTEXT_TOKENS=4096
       - PORT=8000
       - HF_TOKEN=
+      - REDIS_URL=redis://redis:6379/0
+      - SESSION_TTL_SEC=3600
+      - SESSION_LOCK_TTL_SEC=30
+      - SESSION_LOCK_BLOCKING_TIMEOUT_SEC=10
+      - MODEL_REVISION=${MODEL_REVISION:-model-v1}
+      - TTT_STEPS=5
+      - TTT_LR=1e-3
+      - TTT_SAVE_EACH_STEP=0
     volumes:
       - ${CKPT_HOST_PATH:?set CKPT_HOST_PATH}:/models/model.pt:ro
     ports:
       - "8000:8000"
     command: uvicorn inference_service:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - redis
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-ttt
+    command: redis-server --appendonly no
+    ports:
+      - "6379:6379"
 
   prometheus-metrics:
     image: prom/prometheus:latest
